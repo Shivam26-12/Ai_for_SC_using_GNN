@@ -53,18 +53,21 @@ class ChaosEngine:
         """Run a single perturbation and measure impact."""
         model.eval()
 
-        with torch.no_grad():
-            if isinstance(perturbation, AdversarialAttack) and targets is not None:
-                # Adversarial needs gradients
-                pass
-            
+        if isinstance(perturbation, AdversarialAttack) and targets is not None and loss_fn is not None:
+            # Adversarial needs gradients — cannot use no_grad
             perturbed_features, perturbed_edges, perturbed_types = perturbation.apply(
                 node_features, edge_index, edge_type,
-                model=model if isinstance(perturbation, AdversarialAttack) else None,
+                model=model,
                 targets=targets,
                 loss_fn=loss_fn,
                 **model_kwargs,
             )
+        else:
+            with torch.no_grad():
+                perturbed_features, perturbed_edges, perturbed_types = perturbation.apply(
+                    node_features, edge_index, edge_type,
+                    **model_kwargs,
+                )
 
         with torch.no_grad():
             chaos_predictions = model(

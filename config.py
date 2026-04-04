@@ -21,7 +21,7 @@ IS_COLAB = os.path.exists('/content')
 class DataConfig:
     """Data paths and loading configuration."""
     # ── Paths (override for local vs Colab) ──
-    data_dir: str = '/content/drive/MyDrive/M5_data' if IS_COLAB else './data/m5'
+    data_dir: str = '/content/drive/MyDrive/M5_data' if IS_COLAB else './dataset'
     sales_file: str = 'sales_train_evaluation.csv'
     calendar_file: str = 'calendar.csv'
     prices_file: str = 'sell_prices.csv'
