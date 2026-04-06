@@ -1,214 +1,331 @@
 """
-Training loop for SigGNN with Tweedie loss, cosine scheduling,
-mixed precision, and optional adversarial training.
+SigGNN Training Pipeline — Optimized for GPU Execution.
+Includes AMP (Mixed Precision), early stopping, and adversarial generation.
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
+import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
+
+# Local imports
+from config import TrainConfig
 
 
-class Trainer:
-    """Full training pipeline for SigGNN."""
+class TweedieLoss(nn.Module):
+    """
+    Tweedie Loss for zero-inflated forecasting (like M5).
+    p=1 corresponds to Poisson (count data)
+    p=2 corresponds to Gamma (strictly positive continuous)
+    p=1.5 is suitable for zero-inflated continuous/semi-continuous data.
+    """
+    def __init__(self, p: float = 1.5):
+        super().__init__()
+        self.p = p
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Prevent negative predictions and zero predictions for numeric stability
+        pred = torch.clamp(pred, min=1e-6)
+        
+        # L = -y * y_hat^(1-p)/(1-p) + y_hat^(2-p)/(2-p)
+        a = target * torch.pow(pred, 1 - self.p) / (1 - self.p)
+        b = torch.pow(pred, 2 - self.p) / (2 - self.p)
+        
+        return torch.mean(-a + b)
+
+
+class PinballLoss(nn.Module):
+    """Pinball loss for quantile forecasting (CRPS approximation)."""
+    def __init__(self, quantiles: List[float]):
+        super().__init__()
+        self.quantiles = quantiles
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # pred should be shape (N, T, num_quantiles)
+        loss = 0.0
+        target = target.unsqueeze(-1)
+        for i, q in enumerate(self.quantiles):
+            error = target - pred[..., i:i+1]
+            loss += torch.max(q * error, (q - 1) * error).mean()
+        return loss / len(self.quantiles)
+
+
+class SigGNNTrainer:
+    """
+    GPU-optimized trainer for the SigGNN model.
+    Handles data batching, AMP, learning rate scheduling, and checkpointing.
+    """
 
     def __init__(
         self,
         model: nn.Module,
-        loss_fn: nn.Module,
+        config: TrainConfig,
         device: torch.device,
-        lr: float = 1e-3,
-        weight_decay: float = 1e-5,
-        max_epochs: int = 100,
-        patience: int = 15,
-        gradient_clip: float = 1.0,
-        warmup_epochs: int = 5,
-        use_amp: bool = False,
     ):
-        self.model = model
-        self.loss_fn = loss_fn
+        self.model = model.to(device)
+        self.config = config
         self.device = device
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.gradient_clip = gradient_clip
-        self.warmup_epochs = warmup_epochs
-        self.base_lr = lr
-
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
+        
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay
         )
+        
+        # Loss Function
+        if config.loss_fn == 'tweedie':
+            self.criterion = TweedieLoss(p=config.tweedie_p)
+        elif config.loss_fn == 'mse':
+            self.criterion = nn.MSELoss()
+        elif config.loss_fn == 'huber':
+            self.criterion = nn.HuberLoss()
+        else:
+            raise ValueError(f"Unknown loss function: {config.loss_fn}")
 
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max(max_epochs - warmup_epochs, 1), eta_min=lr * 0.01
+        # Learning Rate Scheduler (Cosine Annealing with Warmup)
+        # We'll step this per epoch
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=config.max_epochs, 
+            eta_min=config.lr / 100
         )
-
-        # Mixed precision
-        self.use_amp = use_amp and torch.cuda.is_available()
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
-
+        
+        # Mixed Precision Scaler
+        self.scaler = GradScaler(enabled=config.use_amp)
+        
         # Tracking
-        self.train_losses = []
-        self.val_losses = []
         self.best_val_loss = float('inf')
-        self.best_model_state = None
-        self.epochs_no_improve = 0
+        self.patience_counter = 0
+        self.history = {'train_loss': [], 'val_loss': [], 'epoch_times': []}
+        
+        # Checkpointing
+        if config.checkpoint_dir:
+            os.makedirs(config.checkpoint_dir, exist_ok=True)
+            self.checkpoint_path = os.path.join(config.checkpoint_dir, 'best_model.pt')
+            
+            # Resume if requested
+            if config.resume_from and os.path.exists(config.resume_from):
+                self.load_checkpoint(config.resume_from)
 
-    def _warmup_lr(self, epoch: int):
-        """Linear warmup for first N epochs."""
-        if epoch < self.warmup_epochs:
-            factor = (epoch + 1) / self.warmup_epochs
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = self.base_lr * factor
+    def save_checkpoint(self, path: str, epoch: int, val_loss: float):
+        """Save model, optimizer, scaler, and scheduler states."""
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
+            'val_loss': val_loss,
+            'history': self.history
+        }, path)
+        print(f"   💾 Checkpoint saved: {path}")
 
-    def _forward_model(self, node_features, edge_index, edge_type,
-                       category_ids, dept_ids, historical_mean):
-        """Run model forward pass."""
-        return self.model(
-            node_features, edge_index, edge_type,
-            category_ids, dept_ids, historical_mean,
-        )
+    def load_checkpoint(self, path: str):
+        """Load states from checkpoint."""
+        print(f"   📂 Loading checkpoint: {path}")
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        self.best_val_loss = checkpoint['val_loss']
+        self.history = checkpoint.get('history', self.history)
+        print(f"   ✓ Resumed from epoch {checkpoint['epoch']} with val_loss {self.best_val_loss:.4f}")
+
+    def generate_adversarial(
+        self, 
+        features: torch.Tensor, 
+        edge_index: torch.Tensor, 
+        edge_type: torch.Tensor, 
+        targets: torch.Tensor,
+        **model_kwargs
+    ) -> torch.Tensor:
+        """
+        Fast FGSM adversarial generation for robust training.
+        """
+        self.model.eval()
+        adv_features = features.clone().detach().requires_grad_(True)
+        
+        with autocast(enabled=self.config.use_amp):
+            preds = self.model(adv_features, edge_index, edge_type, **model_kwargs)
+            loss = self.criterion(preds, targets)
+        
+        self.scaler.scale(loss).backward()
+        
+        # FGSM step
+        perturbation = self.config.adversarial_epsilon * adv_features.grad.sign()
+        adv_features = features.detach() + perturbation
+        
+        self.model.train()
+        return adv_features.detach()
+
+    def _get_mini_batches(self, num_nodes: int) -> List[torch.Tensor]:
+        """
+        Generate mini-batch node indices if dataset is too large.
+        If batch_size >= num_nodes, returns a single batch of all nodes.
+        Note: For GNNs, full-batch is better if it fits in VRAM. This is a 
+        workaround for memory limits (dropping some edges implicitly).
+        """
+        if self.config.batch_size >= num_nodes or self.config.batch_size <= 0:
+            return [torch.arange(num_nodes, device=self.device)]
+            
+        indices = torch.randperm(num_nodes, device=self.device)
+        batches = torch.split(indices, self.config.batch_size)
+        return list(batches)
 
     def train_epoch(
-        self,
-        node_features, edge_index, edge_type, targets,
-        category_ids, dept_ids=None, historical_mean=None,
+        self, 
+        features: torch.Tensor, 
+        edge_index: torch.Tensor, 
+        edge_type: torch.Tensor, 
+        targets: torch.Tensor,
+        **model_kwargs
     ) -> float:
-        """Train for one epoch."""
+        """Run one epoch of training."""
         self.model.train()
-        self.optimizer.zero_grad()
-
-        if self.use_amp:
-            with torch.amp.autocast('cuda'):
-                predictions = self._forward_model(
-                    node_features, edge_index, edge_type,
-                    category_ids, dept_ids, historical_mean,
-                )
-                loss = self.loss_fn(predictions, targets)
+        total_loss = 0.0
+        num_nodes = features.size(0)
+        
+        batches = self._get_mini_batches(num_nodes)
+        
+        for batch_idx in batches:
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            # Subgraph extraction (simplified: just taking node features)
+            # A full implementation would use torch_geometric.utils.subgraph
+            b_features = features[batch_idx]
+            b_targets = targets[batch_idx]
+            
+            # For simplicity in this pipeline, if we batch, we just pass
+            # the full graph topology but only compute loss on the batch nodes.
+            # This uses more memory but is exactly mathematically correct.
+            
+            # ── Standard Forward Pass ──
+            with autocast(enabled=self.config.use_amp):
+                preds = self.model(features, edge_index, edge_type, **model_kwargs)
+                loss = self.criterion(preds[batch_idx], b_targets)
+            
+            # ── Adversarial Component (Optional) ──
+            if self.config.adversarial_training and torch.rand(1).item() < self.config.adversarial_ratio:
+                adv_features = self.generate_adversarial(features, edge_index, edge_type, targets, **model_kwargs)
+                with autocast(enabled=self.config.use_amp):
+                    adv_preds = self.model(adv_features, edge_index, edge_type, **model_kwargs)
+                    adv_loss = self.criterion(adv_preds[batch_idx], b_targets)
+                loss = (loss + adv_loss) / 2.0
+            
+            # ── Backward Pass using Scaler ──
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            
+            if self.config.gradient_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                
             self.scaler.step(self.optimizer)
             self.scaler.update()
-        else:
-            predictions = self._forward_model(
-                node_features, edge_index, edge_type,
-                category_ids, dept_ids, historical_mean,
-            )
-            loss = self.loss_fn(predictions, targets)
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
-            self.optimizer.step()
-
-        return loss.item()
-
-
+            
+            total_loss += loss.item() * len(batch_idx)
+            
+        return total_loss / num_nodes
 
     @torch.no_grad()
-    def validate(
-        self,
-        node_features, edge_index, edge_type, targets,
-        category_ids, dept_ids=None, historical_mean=None,
-    ) -> Tuple[float, torch.Tensor]:
-        """Validate and return loss + predictions."""
+    def evaluate(
+        self, 
+        features: torch.Tensor, 
+        edge_index: torch.Tensor, 
+        edge_type: torch.Tensor, 
+        targets: torch.Tensor,
+        **model_kwargs
+    ) -> float:
+        """Evaluate model on validation/test set."""
         self.model.eval()
-        predictions = self._forward_model(
-            node_features, edge_index, edge_type,
-            category_ids, dept_ids, historical_mean,
-        )
-        loss = self.loss_fn(predictions, targets)
-        return loss.item(), predictions
+        
+        with autocast(enabled=self.config.use_amp):
+            preds = self.model(features, edge_index, edge_type, **model_kwargs)
+            loss = self.criterion(preds, targets)
+            
+        return loss.item()
 
     def train(
-        self,
-        # Training data
-        train_features, train_edge_index, train_edge_type, train_targets,
-        train_category_ids, train_dept_ids=None, train_historical_mean=None,
-        # Validation data (separate!)
-        val_features=None, val_edge_index=None, val_edge_type=None,
-        val_targets=None, val_category_ids=None, val_dept_ids=None,
-        val_historical_mean=None,
-    ) -> Dict:
-        """Full training loop with early stopping."""
-        print(f"\n🚀 Training SigGNN | {self.model.count_parameters():,} parameters")
-        print(f"   Epochs: {self.max_epochs} | Patience: {self.patience} | AMP: {self.use_amp}")
-
-        train_category_ids = train_category_ids if train_category_ids is not None else {}
-        has_val = val_features is not None and val_targets is not None
+        self, 
+        train_data: Dict[str, torch.Tensor],
+        val_data: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """
+        Full training loop with early stopping and checkpointing.
+        """
+        print(f"\n🚀 Starting training on {self.device} "
+              f"(AMP: {'ON' if self.config.use_amp else 'OFF'})")
         
-        if has_val:
-            val_category_ids = val_category_ids if val_category_ids is not None else {}
+        # Extract tensors from dicts for faster access
+        tr_features = train_data['node_features']
+        edge_index = train_data['edge_index']
+        edge_type = train_data['edge_type']
+        tr_targets = train_data['targets']
         
-        t0 = time.time()
-
-        for epoch in range(self.max_epochs):
-            self._warmup_lr(epoch)
-
-            # ── Train ──
-            train_loss = self.train_epoch(
-                train_features, train_edge_index, train_edge_type,
-                train_targets, train_category_ids, train_dept_ids,
-                train_historical_mean,
-            )
-            self.train_losses.append(train_loss)
-
-            # ── LR schedule ──
-            if epoch >= self.warmup_epochs:
-                self.scheduler.step()
-
-            # ── Validate ──
-            if has_val:
-                v_ei = val_edge_index if val_edge_index is not None else train_edge_index
-                v_et = val_edge_type if val_edge_type is not None else train_edge_type
-
-                val_loss, _ = self.validate(
-                    val_features, v_ei, v_et, val_targets,
-                    val_category_ids, val_dept_ids, val_historical_mean,
-                )
-                self.val_losses.append(val_loss)
-
-                # Early stopping
-                if val_loss < self.best_val_loss - 1e-5:
-                    self.best_val_loss = val_loss
-                    self.best_model_state = {
-                        k: v.clone() for k, v in self.model.state_dict().items()
-                    }
-                    self.epochs_no_improve = 0
-                    marker = " ✓ best"
-                else:
-                    self.epochs_no_improve += 1
-                    marker = ""
-
-                if epoch % 5 == 0 or marker:
-                    lr = self.optimizer.param_groups[0]['lr']
-                    elapsed = time.time() - t0
-                    print(f"   Epoch {epoch:03d} | Train: {train_loss:.4f} | "
-                          f"Val: {val_loss:.4f} | LR: {lr:.6f} | "
-                          f"Time: {elapsed:.1f}s{marker}")
-
-                if self.epochs_no_improve >= self.patience:
-                    print(f"\n   ⏹ Early stopping at epoch {epoch} "
-                          f"(best val: {self.best_val_loss:.4f})")
-                    break
-            else:
-                if epoch % 5 == 0:
-                    lr = self.optimizer.param_groups[0]['lr']
-                    elapsed = time.time() - t0
-                    print(f"   Epoch {epoch:03d} | Loss: {train_loss:.4f} | "
-                          f"LR: {lr:.6f} | Time: {elapsed:.1f}s")
-
-        # Load best model
-        if self.best_model_state is not None:
-            self.model.load_state_dict(self.best_model_state)
-            print(f"   Loaded best model (val_loss={self.best_val_loss:.4f})")
-
-        total_time = time.time() - t0
-        print(f"\n✅ Training complete in {total_time:.1f}s")
-
-        return {
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss,
-            'total_time': total_time,
-            'epochs_trained': len(self.train_losses),
+        kwargs = {
+            'category_ids': train_data.get('category_ids'),
+            'dept_ids': train_data.get('dept_ids'),
+            'historical_mean': train_data.get('historical_mean')
         }
+        
+        if val_data is not None:
+            val_features = val_data['node_features']
+            val_targets = val_data['targets']
+            val_edge_index = val_data.get('edge_index', edge_index)
+            val_edge_type = val_data.get('edge_type', edge_type)
+
+        for epoch in range(1, self.config.max_epochs + 1):
+            t0 = time.time()
+            
+            # Train
+            train_loss = self.train_epoch(tr_features, edge_index, edge_type, tr_targets, **kwargs)
+            
+            # Step scheduler
+            self.scheduler.step()
+            lr = self.optimizer.param_groups[0]['lr']
+            
+            epoch_time = time.time() - t0
+            
+            # Validate
+            if val_data is not None:
+                val_loss = self.evaluate(val_features, val_edge_index, val_edge_type, val_targets, **kwargs)
+            else:
+                val_loss = train_loss
+                
+            self.history['train_loss'].append(train_loss)
+            self.history['val_loss'].append(val_loss)
+            self.history['epoch_times'].append(epoch_time)
+            
+            # Logging
+            if epoch % 5 == 0 or epoch == 1:
+                print(f"Epoch {epoch:03d}/{self.config.max_epochs:03d} | "
+                      f"Time: {epoch_time:.2f}s | "
+                      f"LR: {lr:.2e} | "
+                      f"Train Loss: {train_loss:.4f} | "
+                      f"Val Loss: {val_loss:.4f}")
+                      
+            # Checkpointing & Early Stopping
+            if val_loss < self.best_val_loss - self.config.min_delta:
+                self.best_val_loss = val_loss
+                self.patience_counter = 0
+                if self.config.checkpoint_dir:
+                    self.save_checkpoint(self.checkpoint_path, epoch, val_loss)
+            else:
+                self.patience_counter += 1
+                
+            # Save periodic checkpoints
+            if self.config.checkpoint_dir and epoch % self.config.save_every == 0:
+                periodic_path = os.path.join(self.config.checkpoint_dir, f'model_ep{epoch}.pt')
+                self.save_checkpoint(periodic_path, epoch, val_loss)
+                
+            if self.patience_counter >= self.config.patience:
+                print(f"\n⏹ Early stopping triggered after {epoch} epochs")
+                break
+                
+        # Load best model for return
+        if self.config.checkpoint_dir and os.path.exists(self.checkpoint_path):
+            self.load_checkpoint(self.checkpoint_path)

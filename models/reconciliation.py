@@ -10,6 +10,7 @@ Uses a differentiable reconciliation layer inspired by MinT
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Optional
 
@@ -164,5 +165,3 @@ class SimpleReconciliation(nn.Module):
         return out
 
 
-# Needed for the import
-import torch.nn.functional as F
