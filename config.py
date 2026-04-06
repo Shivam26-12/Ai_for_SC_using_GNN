@@ -1,6 +1,7 @@
 """
 SigGNN Configuration — All hyperparameters and paths in one place.
 Designed for reproducibility in research experiments.
+Optimized for RTX 4050 6GB VRAM.
 """
 import torch
 import os
@@ -133,7 +134,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    """Training configuration."""
+    """Training configuration — optimized for RTX 4050 6GB."""
     # ── Optimization ──
     lr: float = 1e-3
     weight_decay: float = 1e-5
@@ -153,38 +154,69 @@ class TrainConfig:
     gradient_clip: float = 1.0
     label_smoothing: float = 0.0
 
-    # ── Batching ──
-    batch_size: int = 512  # Mini-batch of nodes per step
-    num_workers: int = 4
+    # ── Batching — tuned for 6GB VRAM (RTX 4050) ──
+    batch_size: int = 256  # Reduced from 512 for 6GB VRAM
+    num_workers: int = 2   # Keep low on Windows
 
-    # ── Mixed precision ──
+    # ── Mixed precision — saves ~40% VRAM ──
     use_amp: bool = True
 
     # ── Chaos adversarial training ──
     adversarial_training: bool = False
-    adversarial_ratio: float = 0.3    # Fraction of batches with perturbation
-    adversarial_epsilon: float = 0.01  # FGSM epsilon
+    adversarial_ratio: float = 0.3
+    adversarial_epsilon: float = 0.01
 
     # ── Ensemble ──
-    num_ensemble: int = 5  # Number of models in ensemble
+    num_ensemble: int = 5
+
+    # ── Checkpointing ──
+    checkpoint_dir: str = './checkpoints'
+    save_every: int = 10  # Save checkpoint every N epochs
+    resume_from: str = ''  # Path to checkpoint to resume from
+
+    # ── GPU settings ──
+    pin_memory: bool = True
+    cudnn_benchmark: bool = True
 
 
 @dataclass
 class ChaosConfig:
-    """Chaos engineering configuration."""
+    """Chaos engineering configuration with Hawkes Process support."""
     # ── Perturbation types and severities ──
-    demand_shock_severity: float = 0.5       # Multiplicative noise scale
-    demand_shock_window: int = 14            # Duration of shock (days)
-    supply_disruption_prob: float = 0.1      # Probability of stockout per item
-    supply_disruption_window: int = 14       # Duration of disruption
-    price_volatility_scale: float = 0.3      # Price noise scale
-    calendar_shift_days: int = 3             # Max calendar shift
-    graph_corruption_ratio: float = 0.2      # Fraction of edges to drop
-    adversarial_epsilon: float = 0.01        # FGSM epsilon
-    adversarial_steps: int = 5              # PGD steps
+    demand_shock_severity: float = 0.5
+    demand_shock_window: int = 14
+    supply_disruption_prob: float = 0.1
+    supply_disruption_window: int = 14
+    price_volatility_scale: float = 0.3
+    calendar_shift_days: int = 3
+    graph_corruption_ratio: float = 0.2
+    adversarial_epsilon: float = 0.01
+    adversarial_steps: int = 5
 
     # ── Evaluation ──
-    num_chaos_trials: int = 10  # Average over multiple random seeds
+    num_chaos_trials: int = 10
+
+    # ── Hawkes Process Parameters ──
+    use_hawkes: bool = True
+
+    # Parameter grid for adversarial regime search
+    hawkes_mu_values: List[float] = field(
+        default_factory=lambda: [0.05, 0.1, 0.2]
+    )
+    hawkes_alpha_values: List[float] = field(
+        default_factory=lambda: [0.3, 0.6, 1.0]
+    )
+    hawkes_beta_values: List[float] = field(
+        default_factory=lambda: [0.5, 1.0, 2.0]
+    )
+
+    # Default Hawkes config (for quick single-config runs)
+    hawkes_default_mu: float = 0.1
+    hawkes_default_alpha: float = 0.6
+    hawkes_default_beta: float = 1.0
+
+    # Intensity trace storage
+    traces_dir: str = './experiments/intensity_traces'
 
 
 @dataclass
@@ -203,6 +235,8 @@ class ExperimentConfig:
         torch.manual_seed(self.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.seed)
+            if self.train.cudnn_benchmark:
+                torch.backends.cudnn.benchmark = True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -216,6 +250,7 @@ def get_debug_config():
     cfg.train.max_epochs = 10
     cfg.train.num_ensemble = 1
     cfg.model.gat.num_layers = 1
+    cfg.chaos.use_hawkes = False  # Skip Hawkes for debug
     cfg.experiment_name = 'debug'
     return cfg
 
@@ -248,4 +283,24 @@ def get_full_config():
     cfg.train.num_ensemble = 5
     cfg.train.adversarial_training = True
     cfg.experiment_name = 'full_siggnn'
+    return cfg
+
+
+def get_gpu_optimized_config():
+    """Config optimized for RTX 4050 6GB VRAM."""
+    cfg = ExperimentConfig()
+    cfg.data.stores = ['CA_1']
+    cfg.train.batch_size = 256
+    cfg.train.use_amp = True
+    cfg.train.max_epochs = 80
+    cfg.train.num_ensemble = 3
+    cfg.model.gat.hidden_dim = 96    # Slightly reduced for VRAM
+    cfg.model.gat.num_layers = 2     # 2 layers saves VRAM
+    cfg.model.predictor_hidden = 192
+    cfg.chaos.use_hawkes = True
+    # Single Hawkes config for speed
+    cfg.chaos.hawkes_mu_values = [0.1]
+    cfg.chaos.hawkes_alpha_values = [0.6]
+    cfg.chaos.hawkes_beta_values = [1.0]
+    cfg.experiment_name = 'gpu_rtx4050'
     return cfg
