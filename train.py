@@ -1,6 +1,14 @@
 """
 SigGNN Training Pipeline — Optimized for GPU Execution.
-Includes AMP (Mixed Precision), early stopping, and adversarial generation.
+Includes AMP (Mixed Precision), early stopping, WRMSSE tracking,
+and NaN-safe training loop.
+
+UPDATED: 
+- Removed broken TweedieLoss that had no softplus guard
+- Uses HuberLoss by default (aligned with RMSE-based WRMSSE)
+- Full-batch training for GNN correctness
+- NaN detection with automatic recovery
+- Epoch-level WRMSSE tracking
 """
 import torch
 import torch.nn as nn
@@ -13,44 +21,7 @@ from typing import Dict, Optional, Tuple, List
 
 # Local imports
 from config import TrainConfig
-
-
-class TweedieLoss(nn.Module):
-    """
-    Tweedie Loss for zero-inflated forecasting (like M5).
-    p=1 corresponds to Poisson (count data)
-    p=2 corresponds to Gamma (strictly positive continuous)
-    p=1.5 is suitable for zero-inflated continuous/semi-continuous data.
-    """
-    def __init__(self, p: float = 1.5):
-        super().__init__()
-        self.p = p
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Prevent negative predictions and zero predictions for numeric stability
-        pred = torch.clamp(pred, min=1e-6)
-        
-        # L = -y * y_hat^(1-p)/(1-p) + y_hat^(2-p)/(2-p)
-        a = target * torch.pow(pred, 1 - self.p) / (1 - self.p)
-        b = torch.pow(pred, 2 - self.p) / (2 - self.p)
-        
-        return torch.mean(-a + b)
-
-
-class PinballLoss(nn.Module):
-    """Pinball loss for quantile forecasting (CRPS approximation)."""
-    def __init__(self, quantiles: List[float]):
-        super().__init__()
-        self.quantiles = quantiles
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # pred should be shape (N, T, num_quantiles)
-        loss = 0.0
-        target = target.unsqueeze(-1)
-        for i, q in enumerate(self.quantiles):
-            error = target - pred[..., i:i+1]
-            loss += torch.max(q * error, (q - 1) * error).mean()
-        return loss / len(self.quantiles)
+from models.siggnn import TweedieLoss, WRMSSEAlignedLoss, BlendedLoss
 
 
 class SigGNNTrainer:
@@ -82,16 +53,21 @@ class SigGNNTrainer:
         elif config.loss_fn == 'mse':
             self.criterion = nn.MSELoss()
         elif config.loss_fn == 'huber':
-            self.criterion = nn.HuberLoss()
+            self.criterion = nn.HuberLoss(delta=1.0)
+        elif config.loss_fn == 'wrmsse':
+            self.criterion = WRMSSEAlignedLoss()
+        elif config.loss_fn == 'blended':
+            self.criterion = BlendedLoss(huber_delta=1.0)
         else:
             raise ValueError(f"Unknown loss function: {config.loss_fn}")
 
-        # Learning Rate Scheduler (Cosine Annealing with Warmup)
-        # We'll step this per epoch
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=config.max_epochs, 
-            eta_min=config.lr / 100
+        # Learning Rate Scheduler — WarmRestarts gives periodic LR boosts
+        # so the GNN can escape local minima instead of dying at low LR
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=20,           # First restart at epoch 20
+            T_mult=2,         # Next restarts at 40, 80, 160...
+            eta_min=config.lr / 50
         )
         
         # Mixed Precision Scaler
@@ -100,7 +76,8 @@ class SigGNNTrainer:
         # Tracking
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        self.history = {'train_loss': [], 'val_loss': [], 'epoch_times': []}
+        self.nan_count = 0
+        self.history = {'train_loss': [], 'val_loss': [], 'epoch_times': [], 'lr': []}
         
         # Checkpointing
         if config.checkpoint_dir:
@@ -136,47 +113,6 @@ class SigGNNTrainer:
         self.history = checkpoint.get('history', self.history)
         print(f"   ✓ Resumed from epoch {checkpoint['epoch']} with val_loss {self.best_val_loss:.4f}")
 
-    def generate_adversarial(
-        self, 
-        features: torch.Tensor, 
-        edge_index: torch.Tensor, 
-        edge_type: torch.Tensor, 
-        targets: torch.Tensor,
-        **model_kwargs
-    ) -> torch.Tensor:
-        """
-        Fast FGSM adversarial generation for robust training.
-        """
-        self.model.eval()
-        adv_features = features.clone().detach().requires_grad_(True)
-        
-        with autocast(enabled=self.config.use_amp):
-            preds = self.model(adv_features, edge_index, edge_type, **model_kwargs)
-            loss = self.criterion(preds, targets)
-        
-        self.scaler.scale(loss).backward()
-        
-        # FGSM step
-        perturbation = self.config.adversarial_epsilon * adv_features.grad.sign()
-        adv_features = features.detach() + perturbation
-        
-        self.model.train()
-        return adv_features.detach()
-
-    def _get_mini_batches(self, num_nodes: int) -> List[torch.Tensor]:
-        """
-        Generate mini-batch node indices if dataset is too large.
-        If batch_size >= num_nodes, returns a single batch of all nodes.
-        Note: For GNNs, full-batch is better if it fits in VRAM. This is a 
-        workaround for memory limits (dropping some edges implicitly).
-        """
-        if self.config.batch_size >= num_nodes or self.config.batch_size <= 0:
-            return [torch.arange(num_nodes, device=self.device)]
-            
-        indices = torch.randperm(num_nodes, device=self.device)
-        batches = torch.split(indices, self.config.batch_size)
-        return list(batches)
-
     def train_epoch(
         self, 
         features: torch.Tensor, 
@@ -185,51 +121,45 @@ class SigGNNTrainer:
         targets: torch.Tensor,
         **model_kwargs
     ) -> float:
-        """Run one epoch of training."""
+        """
+        Run one epoch of training.
+        Uses full-batch for GNN correctness (all nodes participate in message passing).
+        """
         self.model.train()
-        total_loss = 0.0
-        num_nodes = features.size(0)
+        self.optimizer.zero_grad(set_to_none=True)
         
-        batches = self._get_mini_batches(num_nodes)
+        # ── Full-batch forward pass ──
+        with autocast(enabled=self.config.use_amp):
+            preds = self.model(features, edge_index, edge_type, **model_kwargs)
+            
+            # If in residual mode with baseline, targets are raw sales;
+            # preds already have baseline added inside the model
+            loss = self.criterion(preds, targets)
         
-        for batch_idx in batches:
-            self.optimizer.zero_grad(set_to_none=True)
-            
-            # Subgraph extraction (simplified: just taking node features)
-            # A full implementation would use torch_geometric.utils.subgraph
-            b_features = features[batch_idx]
-            b_targets = targets[batch_idx]
-            
-            # For simplicity in this pipeline, if we batch, we just pass
-            # the full graph topology but only compute loss on the batch nodes.
-            # This uses more memory but is exactly mathematically correct.
-            
-            # ── Standard Forward Pass ──
-            with autocast(enabled=self.config.use_amp):
-                preds = self.model(features, edge_index, edge_type, **model_kwargs)
-                loss = self.criterion(preds[batch_idx], b_targets)
-            
-            # ── Adversarial Component (Optional) ──
-            if self.config.adversarial_training and torch.rand(1).item() < self.config.adversarial_ratio:
-                adv_features = self.generate_adversarial(features, edge_index, edge_type, targets, **model_kwargs)
-                with autocast(enabled=self.config.use_amp):
-                    adv_preds = self.model(adv_features, edge_index, edge_type, **model_kwargs)
-                    adv_loss = self.criterion(adv_preds[batch_idx], b_targets)
-                loss = (loss + adv_loss) / 2.0
-            
-            # ── Backward Pass using Scaler ──
-            self.scaler.scale(loss).backward()
-            
-            if self.config.gradient_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            
-            total_loss += loss.item() * len(batch_idx)
-            
-        return total_loss / num_nodes
+        # ── NaN detection ──
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.nan_count += 1
+            print(f"   ⚠️ NaN/Inf loss detected! (count: {self.nan_count})")
+            if self.nan_count >= 3:
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] *= 0.5
+                print(f"   ⚠️ Emergency LR reduction to {self.optimizer.param_groups[0]['lr']:.2e}")
+                self.nan_count = 0
+            return float('nan')
+        
+        # ── Backward pass with gradient scaling ──
+        self.scaler.scale(loss).backward()
+        
+        if self.config.gradient_clip > 0:
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.gradient_clip
+            )
+        
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        
+        return loss.item()
 
     @torch.no_grad()
     def evaluate(
@@ -239,74 +169,143 @@ class SigGNNTrainer:
         edge_type: torch.Tensor, 
         targets: torch.Tensor,
         **model_kwargs
-    ) -> float:
-        """Evaluate model on validation/test set."""
+    ) -> Tuple[float, Optional[np.ndarray]]:
+        """
+        Evaluate model on validation/test set.
+        Returns (loss, predictions_numpy).
+        """
         self.model.eval()
         
         with autocast(enabled=self.config.use_amp):
             preds = self.model(features, edge_index, edge_type, **model_kwargs)
             loss = self.criterion(preds, targets)
-            
-        return loss.item()
+        
+        return loss.item(), preds.float().cpu().numpy()
 
     def train(
         self, 
         train_data: Dict[str, torch.Tensor],
         val_data: Optional[Dict[str, torch.Tensor]] = None,
+        wrmsse_evaluator=None,
+        extra_train_windows: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> None:
         """
-        Full training loop with early stopping and checkpointing.
+        Full training loop with multi-window training, early stopping, 
+        WRMSSE tracking, and checkpointing.
+        
+        Multi-window training: each epoch trains on the primary window plus
+        cycling through extra windows. This gives 5x more diverse training data.
         """
-        print(f"\n🚀 Starting training on {self.device} "
+        print(f"\n[TRAIN] Starting training on {self.device} "
               f"(AMP: {'ON' if self.config.use_amp else 'OFF'})")
         
-        # Extract tensors from dicts for faster access
-        tr_features = train_data['node_features']
+        # Build list of all training windows
+        all_windows = [train_data]
+        if extra_train_windows:
+            all_windows.extend(extra_train_windows)
+        
+        # Extract common graph structure (shared across windows)
         edge_index = train_data['edge_index']
         edge_type = train_data['edge_type']
-        tr_targets = train_data['targets']
         
-        kwargs = {
-            'category_ids': train_data.get('category_ids'),
-            'dept_ids': train_data.get('dept_ids'),
-            'historical_mean': train_data.get('historical_mean')
-        }
+        # Prepare each window's kwargs
+        window_data = []
+        for w in all_windows:
+            wd = {
+                'features': w['node_features'],
+                'targets': w['targets'],
+                'kwargs': {
+                    'category_ids': w.get('category_ids'),
+                    'dept_ids': w.get('dept_ids'),
+                    'historical_mean': w.get('historical_mean'),
+                    'baseline': w.get('baseline'),
+                },
+            }
+            window_data.append(wd)
         
+        # Validation data
+        val_kwargs = {}
         if val_data is not None:
             val_features = val_data['node_features']
             val_targets = val_data['targets']
             val_edge_index = val_data.get('edge_index', edge_index)
             val_edge_type = val_data.get('edge_type', edge_type)
+            val_kwargs = {
+                'category_ids': val_data.get('category_ids'),
+                'dept_ids': val_data.get('dept_ids'),
+                'historical_mean': val_data.get('historical_mean'),
+                'baseline': val_data.get('baseline'),
+            }
+
+        print(f"   Training nodes: {window_data[0]['features'].shape[0]}")
+        print(f"   Feature dim: {window_data[0]['features'].shape[-1]}")
+        print(f"   Training windows: {len(window_data)}")
+        print(f"   Edges: {edge_index.shape[1]}")
+        print(f"   Loss function: {self.config.loss_fn}")
+        print()
 
         for epoch in range(1, self.config.max_epochs + 1):
             t0 = time.time()
             
-            # Train
-            train_loss = self.train_epoch(tr_features, edge_index, edge_type, tr_targets, **kwargs)
+            # ── Anneal blend ratio if using BlendedLoss ──
+            if isinstance(self.criterion, BlendedLoss):
+                # Linear anneal: 0.3 → 0.9 over first 60% of training
+                anneal_end = int(self.config.max_epochs * 0.6)
+                if epoch <= anneal_end:
+                    ratio = 0.3 + 0.6 * (epoch / anneal_end)
+                else:
+                    ratio = 0.9
+                self.criterion.set_blend_ratio(ratio)
             
-            # Step scheduler
+            # ── Multi-window training ──
+            epoch_losses = []
+            for wi, wd in enumerate(window_data):
+                loss = self.train_epoch(
+                    wd['features'], edge_index, edge_type, 
+                    wd['targets'], **wd['kwargs']
+                )
+                if not np.isnan(loss):
+                    epoch_losses.append(loss)
+            
+            train_loss = np.mean(epoch_losses) if epoch_losses else float('nan')
+            
+            # Step scheduler once per epoch
             self.scheduler.step()
             lr = self.optimizer.param_groups[0]['lr']
             
             epoch_time = time.time() - t0
             
             # Validate
+            val_loss = train_loss
+            wrmsse_score = None
             if val_data is not None:
-                val_loss = self.evaluate(val_features, val_edge_index, val_edge_type, val_targets, **kwargs)
-            else:
-                val_loss = train_loss
+                val_loss, val_preds = self.evaluate(
+                    val_features, val_edge_index, val_edge_type, val_targets, 
+                    **val_kwargs
+                )
+                
+                if wrmsse_evaluator is not None and val_preds is not None:
+                    val_actuals = val_targets.cpu().numpy()
+                    wrmsse_score = wrmsse_evaluator.compute_wrmsse(val_preds, val_actuals)
                 
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['epoch_times'].append(epoch_time)
+            self.history['lr'].append(lr)
             
             # Logging
-            if epoch % 5 == 0 or epoch == 1:
+            if epoch % 5 == 0 or epoch == 1 or epoch <= 5:
+                wrmsse_str = f" | WRMSSE: {wrmsse_score:.4f}" if wrmsse_score is not None else ""
                 print(f"Epoch {epoch:03d}/{self.config.max_epochs:03d} | "
-                      f"Time: {epoch_time:.2f}s | "
+                      f"Time: {epoch_time:.1f}s | "
                       f"LR: {lr:.2e} | "
-                      f"Train Loss: {train_loss:.4f} | "
-                      f"Val Loss: {val_loss:.4f}")
+                      f"Train: {train_loss:.4f} | "
+                      f"Val: {val_loss:.4f}"
+                      f"{wrmsse_str}")
+            
+            # Skip NaN epochs for checkpointing
+            if np.isnan(train_loss) or np.isnan(val_loss):
+                continue
                       
             # Checkpointing & Early Stopping
             if val_loss < self.best_val_loss - self.config.min_delta:
@@ -323,9 +322,28 @@ class SigGNNTrainer:
                 self.save_checkpoint(periodic_path, epoch, val_loss)
                 
             if self.patience_counter >= self.config.patience:
-                print(f"\n⏹ Early stopping triggered after {epoch} epochs")
+                print(f"\n[STOP] Early stopping triggered after {epoch} epochs")
                 break
                 
         # Load best model for return
         if self.config.checkpoint_dir and os.path.exists(self.checkpoint_path):
             self.load_checkpoint(self.checkpoint_path)
+
+        # Final evaluation
+        if val_data is not None:
+            final_loss, final_preds = self.evaluate(
+                val_features, val_edge_index, val_edge_type, val_targets, 
+                **val_kwargs
+            )
+            print(f"\n[RESULT] Best model Val Loss: {final_loss:.4f}")
+            
+            if wrmsse_evaluator is not None and final_preds is not None:
+                val_actuals = val_targets.cpu().numpy()
+                final_wrmsse = wrmsse_evaluator.compute_wrmsse(final_preds, val_actuals)
+                print(f"[RESULT] Final WRMSSE: {final_wrmsse:.4f}")
+                
+                hier_scores = wrmsse_evaluator.compute_hierarchical_wrmsse(final_preds, val_actuals)
+                print("\n[RESULT] Hierarchical WRMSSE Breakdown:")
+                for level, score in hier_scores.items():
+                    print(f"   {level:20s}: {score:.4f}")
+

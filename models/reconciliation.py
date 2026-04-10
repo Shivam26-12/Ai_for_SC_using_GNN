@@ -7,6 +7,9 @@ Ensures forecasts are coherent across the M5 hierarchy:
 
 Uses a differentiable reconciliation layer inspired by MinT
 (Minimum Trace optimal reconciliation, Wickramasuriya et al. 2019).
+
+UPDATED: Simplified SimpleReconciliation to remove the double-softplus
+chain that caused gradient instability.
 """
 import torch
 import torch.nn as nn
@@ -115,17 +118,18 @@ class HierarchicalReconciliation(nn.Module):
         return base_forecasts
 
 
-# For the initial version, we use a simpler approach:
-# enforce non-negativity and apply a learned scaling per department
 class SimpleReconciliation(nn.Module):
     """
     Simple reconciliation layer that:
-    1. Enforces non-negative forecasts (sales can't be negative)
-    2. Applies learned per-group scaling factors
+    1. Applies learned per-group scaling factors
+    2. Enforces non-negative forecasts (sales can't be negative)
     3. Optionally clips extreme predictions
+    
+    UPDATED: Removed double-softplus chain that caused gradient instability.
+    Now uses a single ReLU for non-negativity instead of softplus-on-softplus.
     """
 
-    def __init__(self, num_groups: int = 7, max_ratio: float = 10.0):
+    def __init__(self, num_groups: int = 7, max_ratio: float = 50.0):
         """
         Args:
             num_groups: number of department/category groups
@@ -142,26 +146,26 @@ class SimpleReconciliation(nn.Module):
         group_ids: Optional[torch.Tensor] = None,
         historical_mean: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            predictions: (N, horizon) raw predictions
-            group_ids: (N,) department/category group index
-            historical_mean: (N,) mean historical daily sales
-        """
-        # Non-negativity
-        out = F.softplus(predictions)
-
+        out = predictions
+        
         # Per-group scaling
         if group_ids is not None:
-            scale = self.scale[group_ids].unsqueeze(1)  # (N, 1)
-            bias = self.bias[group_ids].unsqueeze(1)    # (N, 1)
-            out = out * F.softplus(scale) + bias
+            # ── FIX: Clamp group_ids to valid range to prevent index errors ──
+            g = group_ids.clamp(0, len(self.scale) - 1)
+            # Use softplus for scale (always positive), clamp to prevent explosion
+            scale = torch.clamp(F.softplus(self.scale[g]), min=0.1, max=10.0).unsqueeze(1)  # (N, 1)
+            bias = self.bias[g].unsqueeze(1)    # (N, 1)
+            out = out * scale + bias
+            
+        # ── FIX: Simple ReLU instead of softplus ──
+        # softplus(softplus(x)) has compounding gradient issues;
+        # ReLU is piecewise linear → stable gradients
+        out = F.relu(out)
 
         # Clip extreme predictions
         if historical_mean is not None:
-            upper = historical_mean.unsqueeze(1) * self.max_ratio
+            # ── FIX: Add 1.0 to prevent zero upper bound for items with 0 historical mean ──
+            upper = (historical_mean.unsqueeze(1) + 1.0) * self.max_ratio
             out = torch.minimum(out, upper)
 
         return out
-
-

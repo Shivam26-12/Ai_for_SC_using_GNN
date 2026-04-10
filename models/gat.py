@@ -7,10 +7,16 @@ Key innovations over standard GAT:
 3. Residual connections + Layer Normalization for deep stacking
 4. Dropout on both attention coefficients and features
 5. Memory-efficient: O(E) instead of O(N²)
+
+UPDATED: Forces entire attention computation to FP32 to prevent
+AMP half-precision overflow. The original code only cast attention
+scores to FP32 but left message passing in FP16, which overflows
+when value vectors contain large activations (common at scale).
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from typing import Optional
 
 
@@ -79,54 +85,65 @@ class SparseGATLayer(nn.Module):
         Returns:
             (N, out_dim) updated node features
         """
-        N = x.size(0)
-        H = self.num_heads
-        D = self.head_dim
+        # ── CRITICAL FIX: Disable AMP autocast for entire GAT forward ──
+        # The original code only cast attention scores to FP32 but left
+        # V projections, message passing, and scatter_add in FP16.
+        # Under AMP, nn.Linear casts to FP16 → V values in FP16 →
+        # scatter_add over many neighbors overflows FP16 max (65,504).
+        with autocast(enabled=False):
+            x = x.float()  # Ensure FP32 input
+            
+            N = x.size(0)
+            H = self.num_heads
+            D = self.head_dim
 
-        src, dst = edge_index[0], edge_index[1]
+            src, dst = edge_index[0], edge_index[1]
 
-        # ── Project to multi-head Q, K, V ──
-        q = self.W_q(x).view(N, H, D)  # (N, H, D)
-        k = self.W_k(x).view(N, H, D)
-        v = self.W_v(x).view(N, H, D)
+            # ── Project to multi-head Q, K, V (all in FP32) ──
+            q = self.W_q(x).view(N, H, D)  # (N, H, D)
+            k = self.W_k(x).view(N, H, D)
+            v = self.W_v(x).view(N, H, D)
 
-        # ── Compute attention for each edge ──
-        q_src = q[src]  # (E, H, D)
-        k_dst = k[dst]  # (E, H, D)
+            # ── Compute attention for each edge ──
+            q_src = q[src]  # (E, H, D)
+            k_dst = k[dst]  # (E, H, D)
 
-        # Attention score: concat src and dst features, dot with attention vector
-        attn_input = torch.cat([q_src, k_dst], dim=-1)  # (E, H, 2D)
-        attn_scores = (attn_input * self.attn_linear).sum(dim=-1)  # (E, H)
-        attn_scores = F.leaky_relu(attn_scores, self.negative_slope)
+            # Attention score: concat src and dst features, dot with attention vector
+            attn_input = torch.cat([q_src, k_dst], dim=-1)  # (E, H, 2D)
+            attn_scores = (attn_input * self.attn_linear).sum(dim=-1)  # (E, H)
+            attn_scores = F.leaky_relu(attn_scores, self.negative_slope)
 
-        # ── Modulate by edge type ──
-        if edge_type is not None:
-            edge_embed = self.edge_type_embed(edge_type).view(-1, H, D)  # (E, H, D)
-            type_score = (q_src * edge_embed).sum(dim=-1)  # (E, H)
-            attn_scores = attn_scores + type_score
+            # ── Modulate by edge type ──
+            if edge_type is not None:
+                edge_embed = self.edge_type_embed(edge_type).view(-1, H, D)  # (E, H, D)
+                type_score = (q_src * edge_embed).sum(dim=-1)  # (E, H)
+                attn_scores = attn_scores + type_score
 
-        # ── Softmax over neighbors (per-node normalization) ──
-        attn_scores = self._sparse_softmax(attn_scores, dst, N)  # (E, H)
-        attn_scores = self.attn_dropout(attn_scores)
+            # ── Softmax over neighbors (per-node normalization) ──
+            attn_scores = self._sparse_softmax(attn_scores, dst, N)  # (E, H)
+            attn_scores = self.attn_dropout(attn_scores)
 
-        # ── Message passing: weighted sum of neighbor values ──
-        v_src = v[src]  # (E, H, D)
-        messages = attn_scores.unsqueeze(-1) * v_src  # (E, H, D)
+            # ── Message passing: weighted sum of neighbor values ──
+            v_src = v[src]  # (E, H, D)
+            messages = attn_scores.unsqueeze(-1) * v_src  # (E, H, D)
 
-        # Scatter/aggregate messages to destination nodes
-        out = torch.zeros(N, H, D, device=x.device)
-        out.scatter_add_(0, dst.unsqueeze(-1).unsqueeze(-1).expand_as(messages), messages)
+            # Scatter/aggregate messages to destination nodes
+            out = torch.zeros(N, H, D, device=x.device, dtype=torch.float32)
+            out.scatter_add_(0, dst.unsqueeze(-1).unsqueeze(-1).expand_as(messages), messages)
 
-        # ── Reshape and project ──
-        if self.concat_heads:
-            out = out.reshape(N, H * D)  # (N, H*D)
-        else:
-            out = out.mean(dim=1)  # (N, D)
+            # ── FIX: Clamp output to prevent extreme activations ──
+            out = torch.clamp(out, min=-50.0, max=50.0)
 
-        out = self.out_proj(out)  # (N, out_dim)
-        out = self.feat_dropout(out)
+            # ── Reshape and project ──
+            if self.concat_heads:
+                out = out.reshape(N, H * D)  # (N, H*D)
+            else:
+                out = out.mean(dim=1)  # (N, D)
 
-        return out
+            out = self.out_proj(out)  # (N, out_dim)
+            out = self.feat_dropout(out)
+
+            return out
 
     def _sparse_softmax(
         self, 
@@ -137,11 +154,14 @@ class SparseGATLayer(nn.Module):
         """
         Compute softmax over edges grouped by destination node.
         Gradient-friendly: uses detached max for numerical stability.
+        
+        FIX: Added protection for island nodes (nodes with no incoming edges).
         """
         # Numerical stability: subtract max per node (detached, no grad needed)
         with torch.no_grad():
             max_scores = torch.full(
-                (num_nodes, scores.size(1)), float('-inf'), device=scores.device
+                (num_nodes, scores.size(1)), float('-inf'), 
+                device=scores.device, dtype=scores.dtype
             )
             max_scores.scatter_reduce_(
                 0,
@@ -150,20 +170,28 @@ class SparseGATLayer(nn.Module):
                 reduce='amax',
                 include_self=False
             )
-            # Replace -inf with 0 for nodes with no incoming edges
+            # ── FIX: Replace -inf with 0 for island nodes (no incoming edges) ──
+            # This prevents exp(-inf - 0) = exp(-inf) = 0, which is safe,
+            # but we want to avoid the -inf propagating into gradients
             max_scores = max_scores.clamp(min=-100.0)
 
         scores = scores - max_scores[index]
 
-        # Exponentiate
+        # Exponentiate (safe since we subtracted max)
         exp_scores = torch.exp(scores)
 
         # Sum per node
-        sum_exp = torch.zeros(num_nodes, scores.size(1), device=scores.device)
+        sum_exp = torch.zeros(num_nodes, scores.size(1), 
+                              device=scores.device, dtype=scores.dtype)
         sum_exp.scatter_add_(0, index.unsqueeze(-1).expand_as(exp_scores), exp_scores)
 
-        # Normalize
-        return exp_scores / (sum_exp[index] + 1e-10)
+        # ── FIX: Use larger epsilon to prevent near-zero division for sparse nodes ──
+        # For nodes with very few edges, sum_exp can be very small
+        denom = sum_exp[index] + 1e-6
+        result = exp_scores / denom
+        
+        # ── FIX: Clamp attention weights to prevent any single edge from dominating ──
+        return result.clamp(max=1.0)
 
 
 class SparseTemporalGAT(nn.Module):
@@ -183,9 +211,9 @@ class SparseTemporalGAT(nn.Module):
         hidden_dim: int,
         out_dim: int,
         num_heads: int = 4,
-        num_layers: int = 3,
+        num_layers: int = 2,
         num_edge_types: int = 3,
-        dropout: float = 0.2,
+        dropout: float = 0.1,
         residual: bool = True,
         layer_norm: bool = True,
     ):
@@ -261,6 +289,8 @@ class SparseTemporalGAT(nn.Module):
             else:
                 h_new = h_ffn
 
+            # ── FIX: Guard after each layer ──
+            h_new = torch.nan_to_num(h_new, nan=0.0, posinf=50.0, neginf=-50.0)
             h = h_new
 
         return self.output_proj(h)

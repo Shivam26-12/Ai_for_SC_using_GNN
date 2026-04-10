@@ -1,0 +1,36 @@
+==================================================
+   📊 FINAL EVALUATION METRICS (WRMSSE-Optimized)
+==================================================
+Store: CA_1
+Epochs: 50
+Residual Mode: ON (DOW baseline)
+Loss: BlendedLoss (WRMSSE+Huber)
+GAT: 4 heads × 96 dim
+Best Ensemble α: 0.00
+Parameters: 1,957,654
+--------------------------------------------------
+WRMSSE (Model Only): 0.9779
+WRMSSE (Ensemble):   0.8494
+WRMSSE (Hierarchical): 1.6478
+--------------------------------------------------
+MAE: 1.2244
+RMSE: 2.5719
+sMAPE: 101.0972
+
+Hierarchical Breakdown:
+  item_store               : 0.8046
+  total                    : 1.7159
+  state                    : 1.7159
+  store                    : 1.7159
+  category                 : 1.7450
+  department               : 1.8701
+  store_category           : 1.7450
+  store_department         : 1.8701
+  overall_wrmsse           : 1.6478
+--------------------------------------------------
+M5 Leaderboard:
+1st Place: 0.5015 | 2nd Place: ~0.52 | Baseline: ~0.65
+==================================================
+
+Training History:
+  Epoch 1: train=1.7970, val=1.5564

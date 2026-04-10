@@ -47,6 +47,7 @@ class WRMSSEEvaluator:
         self.T_train = train_sales.shape[1]
         self.horizon = horizon
         self.metadata = metadata
+        self._full_train_sales = train_sales
 
         # ── Compute scale (denominator) for each series ──
         # Scale = sqrt(mean of squared one-step differences in training data)
@@ -59,10 +60,26 @@ class WRMSSEEvaluator:
         """
         Compute the RMSSE scaling factor for each series.
         scale_i = sqrt( (1/(T-1)) * sum_{t=2}^{T} (y_t - y_{t-1})^2 )
+        Only starts the sequence from the first non-zero demand for each item.
         """
-        diffs = np.diff(train_sales, axis=1)  # (N, T-1)
-        scales = np.sqrt(np.mean(diffs ** 2, axis=1))  # (N,)
-        # Prevent division by zero for constant series
+        scales = np.zeros(train_sales.shape[0])
+        for i in range(train_sales.shape[0]):
+            nz_idx = np.where(train_sales[i] > 0)[0]
+            if len(nz_idx) == 0:
+                scales[i] = 1e-6
+                continue
+                
+            first_nz = nz_idx[0]
+            series = train_sales[i, first_nz:]
+            
+            if len(series) < 2:
+                scales[i] = 1e-6
+                continue
+                
+            diffs = np.diff(series)
+            scales[i] = np.sqrt(np.mean(diffs ** 2))
+            
+        # Prevent division by zero
         scales = np.maximum(scales, 1e-6)
         return scales
 
@@ -214,9 +231,9 @@ class WRMSSEEvaluator:
 
     def _get_aggregated_train(self, mask: np.ndarray) -> np.ndarray:
         """Get aggregated training sales for a group mask."""
-        # This would need the full training sales matrix
-        # For now, return a reasonable approximation
-        return np.ones(self.T_train)  # Placeholder
+        if hasattr(self, '_full_train_sales'):
+            return self._full_train_sales[mask].sum(axis=0)
+        return np.ones(self.T_train)  # Fallback
 
     def set_train_sales(self, train_sales: np.ndarray):
         """Set training sales for hierarchical aggregation."""

@@ -17,6 +17,8 @@ References:
 - Chevyrev & Kormilitzin (2016): "A Primer on the Signature Method"
 - Kidger & Lyons (2020): "Signatory: Differentiable computations of
   the signature and logsignature transforms..."
+
+UPDATED: Forces FP32 in all signature computations to prevent AMP overflow.
 """
 import torch
 import torch.nn as nn
@@ -36,7 +38,7 @@ try:
     HAS_SIGNATORY = True
 except ImportError:
     HAS_SIGNATORY = False
-    print("⚠️ signatory not found. Using manual signature approximation.")
+    print("[INFO] signatory not found. Using manual signature approximation.")
 
 
 def manual_signature_depth2(path: torch.Tensor) -> torch.Tensor:
@@ -48,6 +50,10 @@ def manual_signature_depth2(path: torch.Tensor) -> torch.Tensor:
     - Level 1: ∫ dX_i (increments)
     - Level 2: ∫∫ dX_i ⊗ dX_j (cross-integrals / area elements)
     
+    CRITICAL FIX: Forces FP32 to prevent the einsum outer-product
+    from overflowing under AMP FP16 (max 65,504). With d=32 and
+    T=179 timesteps, accumulated sums routinely exceed this limit.
+    
     Args:
         path: (batch, length, channels) tensor
         
@@ -55,6 +61,10 @@ def manual_signature_depth2(path: torch.Tensor) -> torch.Tensor:
         (batch, d + d²) signature tensor
     """
     B, L, d = path.shape
+    
+    # ── FIX: Force entire computation to FP32 ──
+    path = path.float()
+    
     increments = path[:, 1:, :] - path[:, :-1, :]  # (B, L-1, d)
 
     # Level 1: sum of increments (= endpoint - startpoint)
@@ -65,15 +75,19 @@ def manual_signature_depth2(path: torch.Tensor) -> torch.Tensor:
     cumsum = torch.cumsum(increments, dim=1)  # (B, L-1, d)
     # For each timestep t, compute increment_t ⊗ cumsum_{t-1}
     prev_cumsum = torch.cat([
-        torch.zeros(B, 1, d, device=path.device),
+        torch.zeros(B, 1, d, device=path.device, dtype=torch.float32),
         cumsum[:, :-1, :]
     ], dim=1)  # (B, L-1, d)
 
-    # Outer product and sum
+    # Outer product and sum — this is the operation that overflows in FP16
     level2 = torch.einsum('bti,btj->bij', increments, prev_cumsum)  # (B, d, d)
     level2 = level2.reshape(B, d * d)
 
-    return torch.cat([level1, level2], dim=-1)  # (B, d + d²)
+    result = torch.cat([level1, level2], dim=-1)  # (B, d + d²)
+    
+    # ── FIX: Clamp to prevent extreme signature values ──
+    # Signatures can grow exponentially with path length; clamp for stability
+    return torch.clamp(result, min=-50.0, max=50.0)
 
 
 def compute_signature(path: torch.Tensor, depth: int, 
@@ -96,7 +110,7 @@ def compute_signature(path: torch.Tensor, depth: int,
     else:
         # Manual fallback (depth-2 only)
         if depth > 2:
-            print("⚠️ Manual signature only supports depth 2. Using depth=2.")
+            pass  # Silently use depth 2 — warning was printed at import time
         return manual_signature_depth2(path)
 
 
@@ -161,15 +175,15 @@ class MultiScaleSignatureEncoder(nn.Module):
     
     This captures:
     - Short window (7d): weekly patterns, recent trend
-    - Medium window (28d): monthly patterns, price effects
-    - Long window (90d): seasonal patterns, structural changes
+    - Medium window (14d): bi-weekly patterns
+    - Long window (28d): monthly patterns, price effects
     """
 
     def __init__(
         self,
         input_channels: int,
-        windows: List[int] = [7, 28, 90],
-        depth: int = 3,
+        windows: List[int] = [7, 14, 28],
+        depth: int = 2,
         use_lead_lag: bool = True,
         use_logsig: bool = False,
         projection_dim: Optional[int] = None,
@@ -236,13 +250,16 @@ class MultiScaleSignatureEncoder(nn.Module):
                 pad = window[:, :1, :].expand(B, 2 - actual_w, C)
                 window = torch.cat([pad, window], dim=1)
 
+            # ── FIX: Force FP32 before projection to prevent AMP issues ──
+            window = window.float()
+
             # Project
             window = self.projections[i](window)  # (B, w, proj_dim)
 
             # Lead-lag augmentation
             window = self.lead_lag(window)  # (B, 2w-1, 2*proj_dim) or (B, w, proj_dim)
 
-            # Compute signature
+            # Compute signature (already forced to FP32 inside)
             sig = compute_signature(window, self.depth, self.use_logsig)  # (B, sig_dim)
 
             # Normalize
