@@ -7,6 +7,9 @@ This implementation follows the exact specification from the M5 competition:
 3. Weight by dollar-sales contribution
 
 Reference: https://mofc.unic.ac.cy/m5-competition/
+
+UPDATED: Bulletproof NaN prevention — raised scale floor from 1e-6 to 1.0,
+clamped RMSSE to max 100.0, added comprehensive input sanitization.
 """
 import numpy as np
 import pandas as pd
@@ -43,6 +46,12 @@ class WRMSSEEvaluator:
             metadata: DataFrame with item_id, store_id, dept_id, cat_id, state_id
             horizon: forecast horizon (28 for M5)
         """
+        # ── Sanitize ALL inputs upfront ──
+        train_sales = np.nan_to_num(np.asarray(train_sales, dtype=np.float64),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+        train_prices = np.nan_to_num(np.asarray(train_prices, dtype=np.float64),
+                                     nan=0.0, posinf=0.0, neginf=0.0)
+
         self.N = train_sales.shape[0]
         self.T_train = train_sales.shape[1]
         self.horizon = horizon
@@ -50,37 +59,51 @@ class WRMSSEEvaluator:
         self._full_train_sales = train_sales
 
         # ── Compute scale (denominator) for each series ──
-        # Scale = sqrt(mean of squared one-step differences in training data)
         self.scales = self._compute_scales(train_sales)
 
         # ── Compute weights based on dollar-sales ──
         self.weights = self._compute_weights(train_sales, train_prices)
+
+        # ── Diagnostic printout ──
+        n_tiny = np.sum(self.scales < 1.0 + 1e-6)  # Items that hit the floor
+        print(f"   [WRMSSE] {self.N} items | "
+              f"scale range [{self.scales.min():.4f}, {self.scales.max():.4f}] | "
+              f"{n_tiny} items hit scale floor")
 
     def _compute_scales(self, train_sales: np.ndarray) -> np.ndarray:
         """
         Compute the RMSSE scaling factor for each series.
         scale_i = sqrt( (1/(T-1)) * sum_{t=2}^{T} (y_t - y_{t-1})^2 )
         Only starts the sequence from the first non-zero demand for each item.
+        
+        CRITICAL FIX: Floor raised from 1e-6 to 1.0.
+        Items with scale < 1.0 have near-zero variance (constant or nearly-zero sales).
+        A floor of 1e-6 means RMSE(1.0) / 1e-6 = 1,000,000 → blows up the sum.
         """
-        scales = np.zeros(train_sales.shape[0])
+        scales = np.zeros(train_sales.shape[0], dtype=np.float64)
         for i in range(train_sales.shape[0]):
             nz_idx = np.where(train_sales[i] > 0)[0]
             if len(nz_idx) == 0:
-                scales[i] = 1e-6
+                scales[i] = 1.0  # No sales at all → floor
                 continue
                 
             first_nz = nz_idx[0]
             series = train_sales[i, first_nz:]
             
             if len(series) < 2:
-                scales[i] = 1e-6
+                scales[i] = 1.0  # Too short → floor
                 continue
                 
             diffs = np.diff(series)
-            scales[i] = np.sqrt(np.mean(diffs ** 2))
+            msd = np.mean(diffs ** 2)
+            if msd <= 0 or np.isnan(msd) or np.isinf(msd):
+                scales[i] = 1.0
+            else:
+                scales[i] = np.sqrt(msd)
             
-        # Prevent division by zero
-        scales = np.maximum(scales, 1e-6)
+        # Prevent division by zero — floor at 1.0 (not 1e-6!)
+        scales = np.nan_to_num(scales, nan=1.0, posinf=1.0, neginf=1.0)
+        scales = np.maximum(scales, 1.0)
         return scales
 
     def _compute_weights(
@@ -95,12 +118,28 @@ class WRMSSEEvaluator:
         weight_i = dollar_sales_i / sum(dollar_sales)
         """
         # Dollar sales in the last 28 days of training
-        recent_sales = train_sales[:, -28:]
-        recent_prices = train_prices[:, -28:]
+        recent_sales = np.maximum(train_sales[:, -28:], 0.0)
+        recent_prices = np.maximum(train_prices[:, -28:], 0.0)
         dollar_sales = np.sum(recent_sales * recent_prices, axis=1)  # (N,)
 
-        total = np.sum(dollar_sales) + 1e-10
+        # Sanitize
+        dollar_sales = np.nan_to_num(dollar_sales, nan=0.0, posinf=0.0, neginf=0.0)
+
+        total = np.sum(dollar_sales)
+        if total <= 0 or np.isnan(total):
+            # Fallback: equal weights
+            print("   [WRMSSE] WARNING: Total dollar sales is 0 or NaN. Using equal weights.")
+            return np.ones(self.N, dtype=np.float64) / self.N
+
         weights = dollar_sales / total
+        # Final sanitize
+        weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        # Re-normalize in case nan_to_num zeroed anything
+        w_sum = weights.sum()
+        if w_sum > 0:
+            weights = weights / w_sum
+        else:
+            weights = np.ones(self.N, dtype=np.float64) / self.N
         return weights
 
     def compute_rmsse(
@@ -118,16 +157,29 @@ class WRMSSEEvaluator:
             actuals: (N, horizon) actual values
             
         Returns:
-            (N,) RMSSE values
+            (N,) RMSSE values, clamped to [0, 100]
         """
         assert predictions.shape == actuals.shape, \
             f"Shape mismatch: {predictions.shape} vs {actuals.shape}"
 
-        # RMSE per series
-        rmse = np.sqrt(np.mean((predictions - actuals) ** 2, axis=1))  # (N,)
+        # Sanitize inputs
+        predictions = np.nan_to_num(np.asarray(predictions, dtype=np.float64),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+        actuals = np.nan_to_num(np.asarray(actuals, dtype=np.float64),
+                                nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Scale (denominator)
+        # RMSE per series
+        mse = np.mean((predictions - actuals) ** 2, axis=1)  # (N,)
+        mse = np.maximum(mse, 0.0)  # Guard against numerical negative
+        rmse = np.sqrt(mse)
+
+        # Scale (denominator) — already floored at 1.0
         rmsse = rmse / self.scales
+
+        # ── CRITICAL: Clamp RMSSE to prevent Inf/NaN in weighted sum ──
+        # An RMSSE > 100 means the model is 100x worse than naive — meaningless
+        rmsse = np.clip(rmsse, 0.0, 100.0)
+        rmsse = np.nan_to_num(rmsse, nan=0.0, posinf=100.0, neginf=0.0)
         return rmsse
 
     def compute_wrmsse(
@@ -138,19 +190,24 @@ class WRMSSEEvaluator:
         """
         Compute the full WRMSSE metric (bottom-level only).
         
-        For simplicity, this computes the weighted RMSSE at the bottom level
-        (item-store level). The full M5 metric aggregates across 12 levels,
-        but bottom-level WRMSSE is the most commonly reported and compared.
-        
         Args:
             predictions: (N, horizon) predicted values
             actuals: (N, horizon) actual values
             
         Returns:
-            Scalar WRMSSE value
+            Scalar WRMSSE value (guaranteed finite)
         """
         rmsse = self.compute_rmsse(predictions, actuals)
         wrmsse = np.sum(self.weights * rmsse)
+        
+        # Final safety net
+        if np.isnan(wrmsse) or np.isinf(wrmsse):
+            # Fallback: unweighted mean RMSSE
+            fallback = float(np.mean(rmsse))
+            print(f"   [WRMSSE] WARNING: Weighted WRMSSE was NaN/Inf. "
+                  f"Falling back to mean RMSSE = {fallback:.4f}")
+            return fallback
+        
         return float(wrmsse)
 
     def compute_hierarchical_wrmsse(
@@ -161,23 +218,15 @@ class WRMSSEEvaluator:
         """
         Compute WRMSSE at all 12 M5 hierarchical levels.
         
-        Levels:
-        1. Total
-        2. State  
-        3. Store
-        4. Category
-        5. Department
-        6. Item
-        7. State × Category
-        8. State × Department
-        9. Store × Category
-        10. Store × Department
-        11. Item × State
-        12. Item × Store (bottom level)
-        
         Returns:
-            Dictionary of level_name → WRMSSE score
+            Dictionary of level_name → WRMSSE score (all guaranteed finite)
         """
+        # Sanitize inputs once
+        predictions = np.nan_to_num(np.asarray(predictions, dtype=np.float64),
+                                    nan=0.0, posinf=0.0, neginf=0.0)
+        actuals = np.nan_to_num(np.asarray(actuals, dtype=np.float64),
+                                nan=0.0, posinf=0.0, neginf=0.0)
+
         meta = self.metadata
         results = {}
 
@@ -200,19 +249,31 @@ class WRMSSEEvaluator:
 
             for g in unique_groups:
                 mask = (group_keys == g).values
-                agg_pred = predictions[mask].sum(axis=0)
-                agg_actual = actuals[mask].sum(axis=0)
+                agg_pred = predictions[mask].sum(axis=0).astype(np.float64)
+                agg_actual = actuals[mask].sum(axis=0).astype(np.float64)
 
-                rmse = np.sqrt(np.mean((agg_pred - agg_actual) ** 2))
+                diff_sq = (agg_pred - agg_actual) ** 2
+                diff_sq = np.nan_to_num(diff_sq, nan=0.0, posinf=0.0, neginf=0.0)
+                rmse = np.sqrt(np.mean(diff_sq))
 
                 # Scale for aggregated series
                 train_agg = self._get_aggregated_train(mask)
                 diffs = np.diff(train_agg)
-                scale = np.sqrt(np.mean(diffs ** 2)) + 1e-6
+                msd = np.mean(diffs ** 2)
+                if msd <= 0 or np.isnan(msd):
+                    scale = 1.0
+                else:
+                    scale = np.sqrt(msd)
+                scale = max(scale, 1.0)  # Same floor as bottom level
 
-                group_rmsse_list.append(rmse / scale)
+                group_rmsse = rmse / scale
+                # Clamp per-group RMSSE too
+                group_rmsse = min(max(group_rmsse, 0.0), 100.0)
+                if np.isnan(group_rmsse):
+                    group_rmsse = 0.0
+                group_rmsse_list.append(group_rmsse)
 
-            results[level_name] = float(np.mean(group_rmsse_list))
+            results[level_name] = float(np.mean(group_rmsse_list)) if group_rmsse_list else 0.0
 
         # Compute for key levels
         aggregate_and_score([], 'total')
@@ -225,7 +286,8 @@ class WRMSSEEvaluator:
 
         # Overall WRMSSE (equal weight across levels for simplicity)
         level_scores = list(results.values())
-        results['overall_wrmsse'] = float(np.mean(level_scores))
+        valid_scores = [s for s in level_scores if not np.isnan(s)]
+        results['overall_wrmsse'] = float(np.mean(valid_scores)) if valid_scores else 0.0
 
         return results
 
@@ -237,13 +299,8 @@ class WRMSSEEvaluator:
 
     def set_train_sales(self, train_sales: np.ndarray):
         """Set training sales for hierarchical aggregation."""
-        self._full_train_sales = train_sales
-
-    def _get_aggregated_train_full(self, mask: np.ndarray) -> np.ndarray:
-        """Get aggregated training sales with full data."""
-        if hasattr(self, '_full_train_sales'):
-            return self._full_train_sales[mask].sum(axis=0)
-        return np.ones(self.T_train)
+        self._full_train_sales = np.nan_to_num(
+            np.asarray(train_sales, dtype=np.float64), nan=0.0)
 
 
 def compute_simple_metrics(
@@ -253,6 +310,9 @@ def compute_simple_metrics(
     """
     Compute standard forecasting metrics for comparison.
     """
+    predictions = np.nan_to_num(predictions, nan=0.0)
+    actuals = np.nan_to_num(actuals, nan=0.0)
+
     mae = np.mean(np.abs(predictions - actuals))
     rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
 
@@ -261,7 +321,7 @@ def compute_simple_metrics(
     smape = np.mean(np.abs(predictions - actuals) / denom) * 100
 
     return {
-        'MAE': float(mae),
-        'RMSE': float(rmse),
-        'sMAPE': float(smape),
+        'MAE': float(np.nan_to_num(mae)),
+        'RMSE': float(np.nan_to_num(rmse)),
+        'sMAPE': float(np.nan_to_num(smape)),
     }

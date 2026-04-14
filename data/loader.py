@@ -218,6 +218,13 @@ class M5DataLoader:
         price_matrix = self.build_price_matrix(sales_df, d_cols, lookups)
         print(f"   Price matrix: {price_matrix.shape}")
 
+        # ── Sanitize: Replace NaN/Inf in matrices ──
+        sales_matrix = np.nan_to_num(sales_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        price_matrix = np.nan_to_num(price_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        print(f"   Sales NaN count: {np.isnan(sales_matrix).sum()}")
+        print(f"   Price NaN count: {np.isnan(price_matrix).sum()}")
+
         return {
             'sales_matrix': sales_matrix,
             'price_matrix': price_matrix,

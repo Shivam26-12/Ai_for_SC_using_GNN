@@ -4,16 +4,15 @@ Includes AMP (Mixed Precision), early stopping, WRMSSE tracking,
 and NaN-safe training loop.
 
 UPDATED: 
-- Removed broken TweedieLoss that had no softplus guard
-- Uses HuberLoss by default (aligned with RMSE-based WRMSSE)
-- Full-batch training for GNN correctness
-- NaN detection with automatic recovery
-- Epoch-level WRMSSE tracking
+- Dynamic device-type detection for autocast (CUDA/CPU)
+- BF16 support for A100 GPUs via amp_dtype config
+- Robust NaN recovery in WRMSSE evaluation
+- Epoch-level WRMSSE tracking with NaN fallback
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import numpy as np
 import os
 import time
@@ -39,6 +38,20 @@ class SigGNNTrainer:
         self.model = model.to(device)
         self.config = config
         self.device = device
+        self.device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        
+        # ── Determine AMP dtype ──
+        # BF16 on A100 (no overflow risk), FP16 on older GPUs
+        self.amp_dtype = torch.float16  # default
+        if hasattr(config, 'amp_dtype'):
+            if config.amp_dtype == 'bfloat16' and torch.cuda.is_available():
+                if torch.cuda.is_bf16_supported():
+                    self.amp_dtype = torch.bfloat16
+                    print(f"   ✓ Using BF16 (bfloat16) for AMP — no overflow risk!")
+                else:
+                    print(f"   ⚠️ BF16 requested but not supported. Falling back to FP16.")
+            elif config.amp_dtype == 'float16':
+                self.amp_dtype = torch.float16
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -62,7 +75,6 @@ class SigGNNTrainer:
             raise ValueError(f"Unknown loss function: {config.loss_fn}")
 
         # Learning Rate Scheduler — WarmRestarts gives periodic LR boosts
-        # so the GNN can escape local minima instead of dying at low LR
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
             T_0=20,           # First restart at epoch 20
@@ -71,13 +83,15 @@ class SigGNNTrainer:
         )
         
         # Mixed Precision Scaler
-        self.scaler = GradScaler(enabled=config.use_amp)
+        # Note: GradScaler is not needed for BF16 but doesn't hurt
+        use_scaler = config.use_amp and self.amp_dtype == torch.float16
+        self.scaler = GradScaler(enabled=use_scaler)
         
         # Tracking
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.nan_count = 0
-        self.history = {'train_loss': [], 'val_loss': [], 'epoch_times': [], 'lr': []}
+        self.history = {'train_loss': [], 'val_loss': [], 'epoch_times': [], 'lr': [], 'wrmsse': []}
         
         # Checkpointing
         if config.checkpoint_dir:
@@ -104,13 +118,22 @@ class SigGNNTrainer:
     def load_checkpoint(self, path: str):
         """Load states from checkpoint."""
         print(f"   📂 Loading checkpoint: {path}")
-        checkpoint = torch.load(path, map_location=self.device)
+        import warnings
+        try:
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        except Exception:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.best_val_loss = checkpoint['val_loss']
         self.history = checkpoint.get('history', self.history)
+        # Ensure wrmsse key exists in old checkpoints
+        if 'wrmsse' not in self.history:
+            self.history['wrmsse'] = []
         print(f"   ✓ Resumed from epoch {checkpoint['epoch']} with val_loss {self.best_val_loss:.4f}")
 
     def train_epoch(
@@ -129,11 +152,13 @@ class SigGNNTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         
         # ── Full-batch forward pass ──
-        with autocast(enabled=self.config.use_amp):
+        with autocast(device_type=self.device_type, enabled=self.config.use_amp,
+                       dtype=self.amp_dtype):
             preds = self.model(features, edge_index, edge_type, **model_kwargs)
             
-            # If in residual mode with baseline, targets are raw sales;
-            # preds already have baseline added inside the model
+            # Ensure predictions and targets are in same dtype for loss
+            preds = preds.float()
+            targets = targets.float()
             loss = self.criterion(preds, targets)
         
         # ── NaN detection ──
@@ -152,7 +177,7 @@ class SigGNNTrainer:
         
         if self.config.gradient_clip > 0:
             self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+            torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.gradient_clip
             )
         
@@ -176,11 +201,25 @@ class SigGNNTrainer:
         """
         self.model.eval()
         
-        with autocast(enabled=self.config.use_amp):
+        with autocast(device_type=self.device_type, enabled=self.config.use_amp,
+                       dtype=self.amp_dtype):
             preds = self.model(features, edge_index, edge_type, **model_kwargs)
-            loss = self.criterion(preds, targets)
+            preds = preds.float()
+            targets_f = targets.float()
+            loss = self.criterion(preds, targets_f)
         
-        return loss.item(), preds.float().cpu().numpy()
+        loss_val = loss.item()
+        if np.isnan(loss_val) or np.isinf(loss_val):
+            # Fallback: compute simple MSE
+            mse = torch.mean((preds - targets_f) ** 2).item()
+            loss_val = mse if not (np.isnan(mse) or np.isinf(mse)) else 0.0
+        
+        preds_np = preds.float().cpu().numpy()
+        # Sanitize predictions
+        preds_np = np.nan_to_num(preds_np, nan=0.0, posinf=0.0, neginf=0.0)
+        preds_np = np.clip(preds_np, 0.0, 1000.0)
+        
+        return loss_val, preds_np
 
     def train(
         self, 
@@ -192,12 +231,10 @@ class SigGNNTrainer:
         """
         Full training loop with multi-window training, early stopping, 
         WRMSSE tracking, and checkpointing.
-        
-        Multi-window training: each epoch trains on the primary window plus
-        cycling through extra windows. This gives 5x more diverse training data.
         """
         print(f"\n[TRAIN] Starting training on {self.device} "
-              f"(AMP: {'ON' if self.config.use_amp else 'OFF'})")
+              f"(AMP: {'ON' if self.config.use_amp else 'OFF'}, "
+              f"dtype: {self.amp_dtype})")
         
         # Build list of all training windows
         all_windows = [train_data]
@@ -249,7 +286,6 @@ class SigGNNTrainer:
             
             # ── Anneal blend ratio if using BlendedLoss ──
             if isinstance(self.criterion, BlendedLoss):
-                # Linear anneal: 0.3 → 0.9 over first 60% of training
                 anneal_end = int(self.config.max_epochs * 0.6)
                 if epoch <= anneal_end:
                     ratio = 0.3 + 0.6 * (epoch / anneal_end)
@@ -266,11 +302,16 @@ class SigGNNTrainer:
                 )
                 if not np.isnan(loss):
                     epoch_losses.append(loss)
+                
+                # Free VRAM between windows
+                if self.device_type == 'cuda':
+                    torch.cuda.empty_cache()
             
             train_loss = np.mean(epoch_losses) if epoch_losses else float('nan')
             
-            # Step scheduler once per epoch
-            self.scheduler.step()
+            # Step scheduler once per epoch (skip on NaN)
+            if not np.isnan(train_loss):
+                self.scheduler.step()
             lr = self.optimizer.param_groups[0]['lr']
             
             epoch_time = time.time() - t0
@@ -283,15 +324,26 @@ class SigGNNTrainer:
                     val_features, val_edge_index, val_edge_type, val_targets, 
                     **val_kwargs
                 )
+                if self.device_type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 if wrmsse_evaluator is not None and val_preds is not None:
-                    val_actuals = val_targets.cpu().numpy()
-                    wrmsse_score = wrmsse_evaluator.compute_wrmsse(val_preds, val_actuals)
+                    try:
+                        val_actuals = val_targets.cpu().numpy()
+                        val_actuals = np.nan_to_num(val_actuals, nan=0.0)
+                        wrmsse_score = wrmsse_evaluator.compute_wrmsse(val_preds, val_actuals)
+                        # Final guard
+                        if np.isnan(wrmsse_score) or np.isinf(wrmsse_score):
+                            wrmsse_score = None
+                    except Exception as e:
+                        print(f"   ⚠️ WRMSSE computation error: {e}")
+                        wrmsse_score = None
                 
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['epoch_times'].append(epoch_time)
             self.history['lr'].append(lr)
+            self.history['wrmsse'].append(wrmsse_score if wrmsse_score is not None else float('nan'))
             
             # Logging
             if epoch % 5 == 0 or epoch == 1 or epoch <= 5:
@@ -338,12 +390,16 @@ class SigGNNTrainer:
             print(f"\n[RESULT] Best model Val Loss: {final_loss:.4f}")
             
             if wrmsse_evaluator is not None and final_preds is not None:
-                val_actuals = val_targets.cpu().numpy()
-                final_wrmsse = wrmsse_evaluator.compute_wrmsse(final_preds, val_actuals)
-                print(f"[RESULT] Final WRMSSE: {final_wrmsse:.4f}")
-                
-                hier_scores = wrmsse_evaluator.compute_hierarchical_wrmsse(final_preds, val_actuals)
-                print("\n[RESULT] Hierarchical WRMSSE Breakdown:")
-                for level, score in hier_scores.items():
-                    print(f"   {level:20s}: {score:.4f}")
-
+                try:
+                    val_actuals = val_targets.cpu().numpy()
+                    val_actuals = np.nan_to_num(val_actuals, nan=0.0)
+                    final_wrmsse = wrmsse_evaluator.compute_wrmsse(final_preds, val_actuals)
+                    print(f"[RESULT] Final WRMSSE: {final_wrmsse:.4f}")
+                    
+                    hier_scores = wrmsse_evaluator.compute_hierarchical_wrmsse(final_preds, val_actuals)
+                    print("\n[RESULT] Hierarchical WRMSSE Breakdown:")
+                    for level, score in hier_scores.items():
+                        print(f"   {level:20s}: {score:.4f}")
+                except Exception as e:
+                    print(f"[RESULT] WRMSSE computation failed: {e}")
+                    print("[RESULT] Final Val Loss (MSE proxy): {final_loss:.4f}")

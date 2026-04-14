@@ -8,16 +8,24 @@ Key innovations over standard GAT:
 4. Dropout on both attention coefficients and features
 5. Memory-efficient: O(E) instead of O(N²)
 
-UPDATED: Forces entire attention computation to FP32 to prevent
-AMP half-precision overflow. The original code only cast attention
-scores to FP32 but left message passing in FP16, which overflows
-when value vectors contain large activations (common at scale).
+UPDATED: 
+- Dynamic device detection for autocast (works on both CUDA and CPU)
+- BF16-safe: On A100 with BF16, the GAT can run in mixed precision
+  (BF16 has same exponent range as FP32, no overflow risk)
+- Forces FP32 for attention computation regardless of AMP dtype
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from typing import Optional
+
+
+def _get_device_type(x: torch.Tensor) -> str:
+    """Get the device type string for autocast."""
+    if x.is_cuda:
+        return 'cuda'
+    return 'cpu'
 
 
 class SparseGATLayer(nn.Module):
@@ -85,12 +93,11 @@ class SparseGATLayer(nn.Module):
         Returns:
             (N, out_dim) updated node features
         """
-        # ── CRITICAL FIX: Disable AMP autocast for entire GAT forward ──
-        # The original code only cast attention scores to FP32 but left
-        # V projections, message passing, and scatter_add in FP16.
-        # Under AMP, nn.Linear casts to FP16 → V values in FP16 →
-        # scatter_add over many neighbors overflows FP16 max (65,504).
-        with autocast(enabled=False):
+        # ── CRITICAL: Disable AMP autocast for GAT attention computation ──
+        # Attention scores and scatter_add must be in FP32 to avoid overflow.
+        # On A100 with BF16, this is less critical but still safer.
+        device_type = _get_device_type(x)
+        with autocast(device_type=device_type, enabled=False):
             x = x.float()  # Ensure FP32 input
             
             N = x.size(0)
@@ -105,16 +112,18 @@ class SparseGATLayer(nn.Module):
             v = self.W_v(x).view(N, H, D)
 
             # ── Compute attention for each edge ──
-            q_src = q[src]  # (E, H, D)
-            k_dst = k[dst]  # (E, H, D)
-
-            # Attention score: concat src and dst features, dot with attention vector
-            attn_input = torch.cat([q_src, k_dst], dim=-1)  # (E, H, 2D)
-            attn_scores = (attn_input * self.attn_linear).sum(dim=-1)  # (E, H)
+            attn_l = self.attn_linear[:, :, :D]  # (1, H, D)
+            attn_r = self.attn_linear[:, :, D:]  # (1, H, D)
+            
+            score_src = (q * attn_l).sum(dim=-1)  # (N, H)
+            score_dst = (k * attn_r).sum(dim=-1)  # (N, H)
+            
+            attn_scores = score_src[src] + score_dst[dst]  # (E, H)
             attn_scores = F.leaky_relu(attn_scores, self.negative_slope)
 
             # ── Modulate by edge type ──
             if edge_type is not None:
+                q_src = q[src]
                 edge_embed = self.edge_type_embed(edge_type).view(-1, H, D)  # (E, H, D)
                 type_score = (q_src * edge_embed).sum(dim=-1)  # (E, H)
                 attn_scores = attn_scores + type_score
@@ -131,7 +140,7 @@ class SparseGATLayer(nn.Module):
             out = torch.zeros(N, H, D, device=x.device, dtype=torch.float32)
             out.scatter_add_(0, dst.unsqueeze(-1).unsqueeze(-1).expand_as(messages), messages)
 
-            # ── FIX: Clamp output to prevent extreme activations ──
+            # ── Clamp output to prevent extreme activations ──
             out = torch.clamp(out, min=-50.0, max=50.0)
 
             # ── Reshape and project ──
@@ -154,8 +163,6 @@ class SparseGATLayer(nn.Module):
         """
         Compute softmax over edges grouped by destination node.
         Gradient-friendly: uses detached max for numerical stability.
-        
-        FIX: Added protection for island nodes (nodes with no incoming edges).
         """
         # Numerical stability: subtract max per node (detached, no grad needed)
         with torch.no_grad():
@@ -170,9 +177,7 @@ class SparseGATLayer(nn.Module):
                 reduce='amax',
                 include_self=False
             )
-            # ── FIX: Replace -inf with 0 for island nodes (no incoming edges) ──
-            # This prevents exp(-inf - 0) = exp(-inf) = 0, which is safe,
-            # but we want to avoid the -inf propagating into gradients
+            # Replace -inf with 0 for island nodes (no incoming edges)
             max_scores = max_scores.clamp(min=-100.0)
 
         scores = scores - max_scores[index]
@@ -185,12 +190,11 @@ class SparseGATLayer(nn.Module):
                               device=scores.device, dtype=scores.dtype)
         sum_exp.scatter_add_(0, index.unsqueeze(-1).expand_as(exp_scores), exp_scores)
 
-        # ── FIX: Use larger epsilon to prevent near-zero division for sparse nodes ──
-        # For nodes with very few edges, sum_exp can be very small
+        # Use larger epsilon to prevent near-zero division
         denom = sum_exp[index] + 1e-6
         result = exp_scores / denom
         
-        # ── FIX: Clamp attention weights to prevent any single edge from dominating ──
+        # Clamp attention weights
         return result.clamp(max=1.0)
 
 
@@ -200,9 +204,6 @@ class SparseTemporalGAT(nn.Module):
     
     Architecture per layer:
     x → GAT → LayerNorm → Residual Add → GELU → Dropout
-    
-    The residual connection allows gradient flow in deep networks
-    and prevents over-smoothing (a known GNN problem).
     """
 
     def __init__(
@@ -289,7 +290,7 @@ class SparseTemporalGAT(nn.Module):
             else:
                 h_new = h_ffn
 
-            # ── FIX: Guard after each layer ──
+            # Guard after each layer
             h_new = torch.nan_to_num(h_new, nan=0.0, posinf=50.0, neginf=-50.0)
             h = h_new
 

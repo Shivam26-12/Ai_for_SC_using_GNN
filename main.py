@@ -15,6 +15,7 @@ import argparse
 import sys
 import os
 import numpy as np
+sys.stdout.reconfigure(encoding='utf-8')
 
 from config import get_gpu_optimized_config, get_debug_config, get_a100_optimized_config
 from data.loader import M5DataLoader

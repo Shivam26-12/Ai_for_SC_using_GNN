@@ -82,12 +82,16 @@ def manual_signature_depth2(path: torch.Tensor) -> torch.Tensor:
     # Outer product and sum — this is the operation that overflows in FP16
     level2 = torch.einsum('bti,btj->bij', increments, prev_cumsum)  # (B, d, d)
     level2 = level2.reshape(B, d * d)
+    
+    # ── NaN guard: einsum can produce NaN with extreme inputs ──
+    level1 = torch.nan_to_num(level1, nan=0.0, posinf=0.0, neginf=0.0)
+    level2 = torch.nan_to_num(level2, nan=0.0, posinf=0.0, neginf=0.0)
 
     result = torch.cat([level1, level2], dim=-1)  # (B, d + d²)
     
-    # ── FIX: Clamp to prevent extreme signature values ──
-    # Signatures can grow exponentially with path length; clamp for stability
-    return torch.clamp(result, min=-50.0, max=50.0)
+    # ── Clamp to prevent extreme signature values ──
+    # Tighter clamp (±30) to prevent downstream accumulation
+    return torch.clamp(result, min=-30.0, max=30.0)
 
 
 def compute_signature(path: torch.Tensor, depth: int, 

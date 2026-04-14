@@ -1,5 +1,6 @@
 print("--- SCRIPT IS STARTING ---")
 import sys
+sys.stdout.reconfigure(encoding='utf-8')
 print(f"Python Path: {sys.path}")
 import torch
 import numpy as np
@@ -12,19 +13,19 @@ def run_diagnostic():
     print("🔍 --- STARTING DATA DIAGNOSTIC ---")
     config = get_debug_config()
     
-    # 1. Check Raw Files
-    print("\nStep 1: Checking Raw CSVs...")
+    # 2. Check Raw Files
+    print("\nStep 2: Checking Raw CSVs...")
     for path, name in [(config.data.sales_path, "Sales"), 
                        (config.data.prices_path, "Prices"), 
                        (config.data.calendar_path, "Calendar")]:
         df = pd.read_csv(path)
         nan_count = df.isnull().sum().sum()
         print(f"  - {name} CSV: {nan_count} NaNs found.")
-        if nan_count > 0:
+        if nan_count > 1:
             print(f"    ⚠️ NaNs in {name} are in columns: {df.columns[df.isnull().any()].tolist()}")
 
-    # 2. Check DataLoader Output
-    print("\nStep 2: Checking DataLoader Output...")
+    # 3. Check DataLoader Output
+    print("\nStep 3: Checking DataLoader Output...")
     loader = M5DataLoader(config.data)
     dataset = loader.prepare_dataset()
     

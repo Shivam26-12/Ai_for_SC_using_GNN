@@ -8,6 +8,7 @@ Constructs a heterogeneous graph with three edge types:
 
 Uses COO (edge_index) format for memory-efficient sparse operations.
 """
+from mpl_toolkits import mplot3d
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional
@@ -57,11 +58,19 @@ class HierarchicalGraphBuilder:
         groups = metadata.groupby(['store_id', 'dept_id']).groups
         for group_name, indices in groups.items():
             idx_list = indices.tolist()
-            # Connect all pairs within the group (small groups, so O(k²) is fine)
+            if len(idx_list) < 2:
+                continue
+                
+            # ── CRITICAL FIX: Limit dense clique sizes ──
+            # Departments can have 400 items. O(k²) pairs = 160,000 edges per dept!
+            np.random.seed(42)
             for i in range(len(idx_list)):
-                for j in range(i + 1, len(idx_list)):
-                    src_list.extend([idx_list[i], idx_list[j]])
-                    dst_list.extend([idx_list[j], idx_list[i]])
+                k = min(10, len(idx_list) - 1)
+                peers = np.random.choice(idx_list, size=k, replace=False)
+                for p in peers:
+                    if p != idx_list[i]:
+                        src_list.append(idx_list[i])
+                        dst_list.append(p)
 
         # Also connect items in same category across departments (same store)
         groups_cat = metadata.groupby(['store_id', 'cat_id']).groups

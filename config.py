@@ -1,9 +1,11 @@
 """
 SigGNN Configuration — All hyperparameters and paths in one place.
 Designed for reproducibility in research experiments.
-Optimized for RTX 4050 6GB VRAM.
 
-UPDATED: Tuned for numerical stability and WRMSSE optimization.
+UPDATED: 
+- Added amp_dtype for BF16 support on A100
+- A100 config uses BF16 (no overflow risk), larger capacity
+- Removed 90-day signature window (primary NaN source)
 """
 import torch
 import torch.nn as nn
@@ -73,7 +75,7 @@ class FeatureConfig:
 @dataclass
 class SignatureConfig:
     """Path signature encoder parameters."""
-    windows: List[int] = field(default_factory=lambda: [7, 14, 28])  # Removed 90 — causes FP16 overflow
+    windows: List[int] = field(default_factory=lambda: [7, 14, 28])
     depth: int = 2  # Manual implementation only supports depth 2
     use_logsig: bool = False 
     use_lead_lag: bool = True
@@ -87,10 +89,10 @@ class SignatureConfig:
 @dataclass
 class GATConfig:
     """Graph Attention Network parameters."""
-    hidden_dim: int = 64      # Reduced to fight overfitting (3049 items / 1.5M params was too high)
+    hidden_dim: int = 64
     num_heads: int = 4
     num_layers: int = 2
-    dropout: float = 0.2       # Stronger regularization
+    dropout: float = 0.2
     edge_types: int = 3 
     residual: bool = True
     layer_norm: bool = True
@@ -103,20 +105,20 @@ class ModelConfig:
     gat: GATConfig = field(default_factory=GATConfig)
     predictor_hidden: int = 128
     predictor_layers: int = 2
-    predictor_dropout: float = 0.3  # Strong dropout to prevent overfitting
+    predictor_dropout: float = 0.3
     horizon: int = 28
 
 
 @dataclass
 class TrainConfig:
-    """Training configuration — Optimized for RTX 4050 6GB."""
-    lr: float = 2e-4              # Lower LR for smoother convergence  
-    weight_decay: float = 5e-4    # Stronger L2 regularization
-    max_epochs: int = 200         # More epochs with lower LR
-    patience: int = 30            # Longer patience with lower LR
+    """Training configuration."""
+    lr: float = 2e-4
+    weight_decay: float = 5e-4
+    max_epochs: int = 200
+    patience: int = 30
     min_delta: float = 1e-4
 
-    loss_fn: str = 'huber'        # Huber is more stable than pure WRMSSE for training
+    loss_fn: str = 'huber'
     tweedie_p: float = 1.5 
 
     scheduler: str = 'cosine'
@@ -126,9 +128,10 @@ class TrainConfig:
     label_smoothing: float = 0.0
 
     # GNN should use full-batch for correct message passing
-    batch_size: int = 0           # 0 = full batch (3,049 nodes fits easily in 6GB)
+    batch_size: int = 0           # 0 = full batch
     num_workers: int = 2 
-    use_amp: bool = True          # Must stay True for 6GB cards
+    use_amp: bool = True
+    amp_dtype: str = 'float16'    # 'float16' or 'bfloat16' (A100)
 
     adversarial_training: bool = False
     adversarial_ratio: float = 0.3
@@ -203,6 +206,7 @@ def get_gpu_optimized_config():
     cfg.data.stores = ['CA_1']
     cfg.train.batch_size = 0       # Full batch for GNN correctness
     cfg.train.use_amp = True
+    cfg.train.amp_dtype = 'float16'
     cfg.train.lr = 2e-4
     cfg.train.max_epochs = 200
     cfg.train.num_ensemble = 1
@@ -212,19 +216,29 @@ def get_gpu_optimized_config():
     return cfg
 
 def get_a100_optimized_config():
-    """Config aggressively optimized for A100 40GB/80GB (Lightning AI)."""
+    """Config aggressively optimized for A100 40GB/80GB (Lightning AI).
+    
+    Key differences from RTX 4050 config:
+    - BF16 instead of FP16 (same exponent range as FP32 → no overflow!)
+    - Larger model capacity (128 hidden, 8 heads, 3 layers)
+    - Wider predictor (256 hidden, 3 layers)
+    - No 90-day signature window (was primary NaN source)
+    """
     cfg = ExperimentConfig()
     cfg.train.batch_size = 0       
-    cfg.train.use_amp = True       # Ampere tensor cores are ultra-fast with FP16/BF16
+    cfg.train.use_amp = True       
+    cfg.train.amp_dtype = 'bfloat16'  # ← KEY: BF16 on A100, no overflow!
     cfg.train.lr = 3e-4            
     cfg.train.max_epochs = 200
+    cfg.train.patience = 40
     cfg.train.num_ensemble = 1
     
-    # 🚀 Unleash Model Capacity
-    cfg.model.signature.windows = [7, 14, 28, 90]  # Re-enable long-term paths
+    # 🚀 Unleash Model Capacity (safe with BF16)
+    cfg.model.signature.windows = [7, 14, 28]  # NO 90-day window
     cfg.model.gat.hidden_dim = 128
     cfg.model.gat.num_layers = 3
     cfg.model.gat.num_heads = 8
+    cfg.model.gat.dropout = 0.15
     cfg.model.predictor_hidden = 256
     cfg.model.predictor_layers = 3
     
